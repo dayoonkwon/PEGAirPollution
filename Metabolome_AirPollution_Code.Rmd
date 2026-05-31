@@ -1,0 +1,468 @@
+---
+title: "Air Pollution and the Serum Metabolome in Patients with Parkinson's Disease"
+author: "Dayoon Kwon"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(readr)
+library(readxl)
+library(limma)
+library(preprocessCore)
+library(KEGGREST)
+```
+
+# Introduction
+
+This file documents code used to perform the main statistical analyses detailed in the manuscript ***Air Pollution and the Serum Metabolome in Patients with Parkinson's Disease***. The analyses include a metabolome-wide association study (MWAS) of long-term ambient air pollution exposures (PM~2.5~, CO, and NO~2~) with untargeted serum LC-HRMS metabolomic features in PD patients and population-based controls, followed by metabolite annotation and pathway enrichment analysis.
+
+# Setting up R environment for statistical analyses
+
+## Create needed functions for analyses
+
+```{r}
+# LIMMA wrapper: build design matrix dynamically and run eBayes
+run_limma <- function(metabolic, covariates, covariate_names) {
+  formula_str <- paste(" ~ ", paste(covariate_names, collapse = "+"))
+  design <- model.matrix(as.formula(formula_str), data = covariates)
+  fit <- lmFit(metabolic, design)
+  fit <- eBayes(fit)
+  return(fit)
+}
+
+# Core MWAS function: loops over exposures and fits LIMMA in the full sample
+# and within each PEG wave (PEG1, PEG2). Returns log2 fold-changes, CIs, and
+# a flag indicating consistent direction with p < 0.05 across PEG1 and PEG2.
+run_analysis <- function(exposures, data, matrix_link, matrix_data,
+                         covariates, PD_status) {
+  all_results <- list()
+
+  for (exposure in exposures) {
+    # Build phenotype data for this exposure
+    phenotype_data <- data %>%
+      left_join(matrix_link %>%
+                  rename(PEGID = pegid) %>%
+                  filter(type == "baseline") %>%
+                  select(PEGID, FullRunName),
+                by = "PEGID") %>%
+      filter(PD == PD_status) %>%
+      select(FullRunName, peg, PD, !!sym(exposure), all_of(covariates)) %>%
+      arrange(FullRunName) %>%
+      na.omit()
+    rownames(phenotype_data) <- phenotype_data$FullRunName
+
+    # Align intensity matrix to phenotype rows
+    matrix_prepared <- matrix_data %>%
+      t() %>% data.frame() %>%
+      filter(rownames(.) %in% phenotype_data$FullRunName) %>%
+      arrange(rownames(.)) %>%
+      as.matrix() %>% t()
+
+    run_limma_subset <- function(subset_data, covariate_vec) {
+      fit <- run_limma(matrix_prepared[, subset_data$FullRunName],
+                      subset_data, covariate_vec)
+      topTable(fit, coef = exposure, n = Inf, adjust = "fdr", confint = TRUE) %>%
+        mutate(
+          mz   = sub("mz_rt_([0-9.]+)_([0-9.]+)", "\\1", rownames(.)),
+          time = sub(".*_([0-9.]+)$", "\\1", rownames(.)),
+          log2FC = logFC / log(2),
+          LL = CI.L / log(2),
+          UL = CI.R / log(2)
+        ) %>%
+        select(mz:time, log2FC, LL, UL, AveExpr, t, P.Value, adj.P.Val) %>%
+        arrange(adj.P.Val, P.Value)
+    }
+
+    # Full sample (include PEG wave as a covariate)
+    result_all  <- run_limma_subset(phenotype_data, c(covariates, exposure))
+
+    # PEG1 and PEG2 separately (drop PEG covariate, rename outputs)
+    result_peg1 <- run_limma_subset(filter(phenotype_data, peg == 1),
+                                    c(setdiff(covariates, "peg"), exposure)) %>%
+      rename_with(~ paste0(., "_peg1"), -c(mz, time))
+    result_peg2 <- run_limma_subset(filter(phenotype_data, peg == 2),
+                                    c(setdiff(covariates, "peg"), exposure)) %>%
+      rename_with(~ paste0(., "_peg2"), -c(mz, time))
+
+    final_result <- result_all %>%
+      left_join(result_peg1, by = c("mz", "time")) %>%
+      left_join(result_peg2, by = c("mz", "time")) %>%
+      mutate(
+        pvalue_and_direction = ifelse(
+          P.Value < 0.05 & sign(log2FC_peg1) == sign(log2FC_peg2), 1, 0),
+        PD = PD_status
+      )
+
+    all_results[[exposure]] <- final_result
+  }
+
+  return(all_results)
+}
+
+# Build mz/rt input table for xMSannotator from a feature intensity matrix
+annotation_input <- function(data) {
+  split_names <- strsplit(rownames(data), "_")
+  mz_rt_df <- do.call(rbind, lapply(split_names, function(x) {
+    data.frame(mz = as.numeric(x[3]), time = as.numeric(x[4]))
+  }))
+  cbind(mz_rt_df, data)
+}
+
+# Convert ppm tolerance to an absolute mz window
+ppm_to_mz <- function(mz, ppm) mz * (ppm / 1e6)
+
+# Parse pollutant / averaging window from MWAS result list element names
+extract_info <- function(name, mode) {
+  parts <- strsplit(name, "_")[[1]]
+  pollutant <- parts[1]; year <- parts[2]
+  model <- dplyr::case_when(
+    pollutant == "pm"   ~ "ctm",
+    pollutant == "co"   ~ "caline4",
+    pollutant == "pm25" ~ "lur",
+    pollutant == "no"   ~ "lur"
+  )
+  pollutant_name <- dplyr::case_when(
+    pollutant == "pm"   ~ "pm2.5",
+    pollutant == "pm25" ~ "pm2.5",
+    pollutant == "co"   ~ "co",
+    pollutant == "no"   ~ "no2"
+  )
+  data.frame(mode = mode, pollutant = pollutant_name,
+             model = model, year = gsub("y", "", year))
+}
+
+# Flatten a per-exposure list of MWAS result tables into one data frame,
+# tagging each row with mode/pollutant/model/year via extract_info()
+combine_results <- function(results_list, mode_name) {
+  bind_rows(lapply(names(results_list), function(name) {
+    df <- results_list[[name]]
+    meta <- extract_info(name, mode_name)
+    cbind(meta, df)
+  }))
+}
+```
+
+# Air pollution exposure data
+
+## Correlation across exposure models and averaging windows
+
+```{r, warning=FALSE, message=FALSE}
+# ap_data: subject-level air pollution exposures across 4 models
+# (PM2.5 CTM, CO CALINE4, PM2.5 LUR, NO2 LUR) x 3 averaging windows (1Y, 3Y, 5Y).
+exposures <- c("pm_1y",  "co_1y",  "pm25_1y", "no_1y",
+               "pm_3y",  "co_3y",  "pm25_3y", "no_3y",
+               "pm_5y",  "co_5y",  "pm25_5y", "no_5y")
+
+correlation_matrix <- cor(ap_data %>% select(all_of(exposures)) %>% na.omit(),
+                          method = "spearman")
+```
+
+## Descriptive statistics
+
+```{r, warning=FALSE, message=FALSE}
+descriptive_stats <- lapply(exposures, function(var) {
+  ap_data %>%
+    summarise(
+      Variable = var,
+      Mean     = mean(.data[[var]], na.rm = TRUE),
+      SD       = sd(.data[[var]], na.rm = TRUE),
+      Minimum  = min(.data[[var]], na.rm = TRUE),
+      Q1       = quantile(.data[[var]], 0.25, na.rm = TRUE),
+      Median   = median(.data[[var]], na.rm = TRUE),
+      Q3       = quantile(.data[[var]], 0.75, na.rm = TRUE),
+      Maximum  = max(.data[[var]], na.rm = TRUE),
+      IQR      = IQR(.data[[var]], na.rm = TRUE)
+    )
+}) %>% bind_rows()
+```
+
+## IQR scaling of exposures
+
+```{r, warning=FALSE, message=FALSE}
+# Scale each exposure by its interquartile range so effect estimates
+# are reported per one-IQR increment.
+ap_data2 <- ap_data %>%
+  mutate(across(all_of(exposures), ~ ./IQR(., na.rm = TRUE),
+                .names = "{.col}_iqr"))
+
+exposures <- ap_data2 %>% select(ends_with("_iqr")) %>% names()
+```
+
+# Metabolome-Wide Association Study (MWAS)
+
+## Run LIMMA across all exposures, separately by PD status
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+# Covariates: age, sex, race/ethnicity, education (years), sample year, PEG wave
+covariate_names <- c("agenew", "sex", "minority", "a1_schyrs",
+                     "sample_year", "peg")
+
+# pheno: merged phenotype/covariate table including PD status and exposures
+# link_hilic / link_c18: maps subject IDs (PEGID) to LC-MS FullRunName for
+#   the HILIC-positive and C18-negative modes
+# metab_hilic / metab_c18: post-QC, batch-corrected feature intensity matrices
+#   (rows = features named "mz_rt_<mz>_<rt>", columns = FullRunName)
+
+# PD cases
+results_hilic_PD1 <- run_analysis(exposures, pheno, link_hilic, metab_hilic,
+                                  covariate_names, PD_status = 1)
+results_c18_PD1   <- run_analysis(exposures, pheno, link_c18,   metab_c18,
+                                  covariate_names, PD_status = 1)
+
+# Population-based controls
+results_hilic_PD0 <- run_analysis(exposures, pheno, link_hilic, metab_hilic,
+                                  covariate_names, PD_status = 0)
+results_c18_PD0   <- run_analysis(exposures, pheno, link_c18,   metab_c18,
+                                  covariate_names, PD_status = 0)
+```
+
+## Combine into a single MWAS results table
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+df_PD1 <- bind_rows(combine_results(results_hilic_PD1, "hilic"),
+                    combine_results(results_c18_PD1,   "c18"))
+df_PD0 <- bind_rows(combine_results(results_hilic_PD0, "hilic"),
+                    combine_results(results_c18_PD0,   "c18"))
+
+df <- bind_rows(df_PD1, df_PD0) %>%
+  mutate(
+    year      = as.integer(year),
+    mode      = factor(mode,      levels = c("hilic", "c18")),
+    pollutant = factor(pollutant, levels = c("pm2.5", "co", "no2")),
+    model     = factor(model,     levels = c("ctm", "caline4", "lur"))
+  ) %>%
+  arrange(PD, mode, pollutant, model, year, adj.P.Val, P.Value) %>%
+  select(mode, pollutant, model, year, PD, everything())
+
+# Flag features that are nominally significant with consistent direction
+# in BOTH PD cases and controls.
+df2 <- df %>%
+  group_by(pollutant, model, year, mode, mz, time) %>%
+  mutate(
+    shared_signal_flag = ifelse(
+      sum(PD == 1 & pvalue_and_direction == 1) > 0 &
+      sum(PD == 0 & pvalue_and_direction == 1) > 0, 1, 0
+    )
+  ) %>%
+  ungroup()
+```
+
+# PD vs Control comparison
+
+For each feature, compare nominal significance and direction across PD cases and controls. "Both" features (p < 0.05 with consistent direction in both groups) are the target set for shared-response interpretation.
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+df_pd <- df2 %>% filter(PD == 1) %>%
+  select(mz, time, mode, pollutant, model, year,
+         log2FC_PD = log2FC, pval_dir_PD = pvalue_and_direction)
+df_ctrl <- df2 %>% filter(PD == 0) %>%
+  select(mz, time, mode, pollutant, model, year,
+         log2FC_CTRL = log2FC, pval_dir_CTRL = pvalue_and_direction)
+
+df_pdctrl <- left_join(df_pd, df_ctrl,
+                       by = c("mz", "time", "mode", "pollutant", "model", "year")) %>%
+  mutate(
+    sig = case_when(
+      pval_dir_PD == 1 & pval_dir_CTRL == 1 ~ "Both",
+      pval_dir_PD == 1                       ~ "PD only",
+      pval_dir_CTRL == 1                     ~ "Control only",
+      TRUE                                   ~ "NS"
+    ),
+    sig = factor(sig, levels = c("Both", "PD only", "Control only", "NS"))
+  )
+
+# Pearson correlation between PD and Control log2FC among "Both" features,
+# stratified by pollutant x model
+cor_pd_vs_ctrl <- df_pdctrl %>%
+  filter(sig == "Both") %>%
+  group_by(pollutant, model, year) %>%
+  summarise(
+    n           = n(),
+    correlation = cor(log2FC_PD, log2FC_CTRL, method = "pearson"),
+    p_value     = cor.test(log2FC_PD, log2FC_CTRL, method = "pearson")$p.value,
+    .groups = "drop"
+  )
+```
+
+# Replication: PEG1 vs PEG2
+
+```{r warning=FALSE, message=FALSE, eval=FALSE}
+df_peg <- df2 %>%
+  filter(PD == 1) %>%
+  mutate(
+    sig = case_when(
+      adj.P.Val < 0.05 & sign(log2FC_peg1) == sign(log2FC_peg2) ~ "FDR<0.05, same dir",
+      P.Value  < 0.05 & sign(log2FC_peg1) == sign(log2FC_peg2)  ~ "p<0.05, same dir",
+      (adj.P.Val < 0.05 | P.Value < 0.05) &
+        sign(log2FC_peg1) != sign(log2FC_peg2)                   ~ "p<0.05, opp dir",
+      TRUE                                                        ~ "NS"
+    )
+  )
+
+# Correlation between PEG1 and PEG2 effect sizes among same-direction,
+# nominally significant features, stratified by pollutant x model
+cor_peg1_vs_peg2 <- df_peg %>%
+  filter(sig == "p<0.05, same dir") %>%
+  group_by(pollutant, model, year) %>%
+  summarise(
+    n           = n(),
+    correlation = cor(log2FC_peg1, log2FC_peg2, method = "pearson"),
+    p_value     = cor.test(log2FC_peg1, log2FC_peg2, method = "pearson")$p.value,
+    .groups = "drop"
+  )
+```
+
+# Pathway enrichment analysis (Mummichog)
+
+## Combine Mummichog output across exposures
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+# mummichog_data: list of pathway-enrichment tables, one per exposure folder.
+# Each folder name encodes pollutant and averaging window.
+mummichog_data2 <- list()
+for (name in names(mummichog_data)) {
+  pollutant <- strsplit(name, "_")[[1]][1]
+  avgyr     <- strsplit(name, "_")[[1]][2]
+  mummichog_data2[[name]] <- mummichog_data[[name]] %>%
+    mutate(pollutant = pollutant, avgyr = avgyr)
+}
+
+mummichog_data3 <- bind_rows(mummichog_data2) %>%
+  mutate(EnrichmentFactor = Hits.sig / Expected)
+
+# A pathway is treated as significant when BOTH Hits.sig >= 5 AND
+# P.Fisher. < 0.05.
+sig_pathways <- mummichog_data3 %>%
+  filter(P.Fisher. < 0.05 & Hits.sig >= 5)
+```
+
+# Metabolite annotation
+
+## In-house library (tier-1 confidence)
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+# Filter MWAS results to nominally significant features and build mz/rt
+# match windows for library lookup.
+mz_tolerance_ppm <- 10   # ppm
+time_tolerance_s <- 30   # seconds
+
+annotation_base <- df2 %>%
+  filter(P.Value < 0.05) %>%
+  select(mode:UL, P.Value, adj.P.Val) %>%
+  mutate(mz   = round(as.numeric(mz),   3),
+         time = round(as.numeric(time), 3),
+         lower_mz   = mz - ppm_to_mz(mz, mz_tolerance_ppm),
+         upper_mz   = mz + ppm_to_mz(mz, mz_tolerance_ppm),
+         lower_time = time - time_tolerance_s,
+         upper_time = time + time_tolerance_s) %>%
+  select(mode:time, lower_mz:upper_time, everything())
+
+# In-house HILIC (positive mode) library
+inhouse_hilic2 <- annotation_base %>%
+  filter(mode == "hilic") %>%
+  left_join(inhouse_hilic, by = character()) %>%
+  filter(mz_library   >= lower_mz   & mz_library   <= upper_mz,
+         time_library >= lower_time & time_library <= upper_time) %>%
+  mutate(mz_diff = abs(mz - mz_library),
+         rt_diff = abs(time - time_library))
+
+# In-house C18 (negative mode) library — same join pattern
+inhouse_c182 <- annotation_base %>%
+  filter(mode == "c18") %>%
+  left_join(inhouse_c18, by = character()) %>%
+  filter(mz_library   >= lower_mz   & mz_library   <= upper_mz,
+         time_library >= lower_time & time_library <= upper_time) %>%
+  mutate(mz_diff = abs(mz - mz_library),
+         rt_diff = abs(time - time_library))
+
+inhouse <- bind_rows(inhouse_hilic2, inhouse_c182)
+annotation_base2 <- merge(annotation_base, inhouse) %>% distinct()
+```
+
+## Mummichog matched compounds + KEGG names
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+# compound_data: list of "mummichog_matched_compound_all" tables per exposure
+compound_data2 <- list()
+for (name in names(compound_data)) {
+  pollutant_info <- strsplit(name, "_")[[1]]
+  compound_data2[[name]] <- compound_data[[name]] %>%
+    mutate(pollutant = pollutant_info[1], year = pollutant_info[2])
+}
+
+compound_data3 <- bind_rows(compound_data2) %>%
+  rename(mz = Query.Mass, time = Retention.Time,
+         Best_Guess_Compound = Matched.Compound,
+         ion = Matched.Form, mz_Diff = Mass.Diff) %>%
+  select(pollutant, year, mz, time, Best_Guess_Compound, ion, mz_Diff)
+
+# Look up compound names from KEGG
+compound_ids  <- unique(compound_data3$Best_Guess_Compound)
+compound_info <- list()
+for (compound_id in compound_ids) {
+  tryCatch({
+    kegg_data <- keggGet(compound_id)
+    if (!is.null(kegg_data[[1]])) {
+      compound_info[[compound_id]] <- kegg_data[[1]]$NAME[1]
+    }
+  }, error = function(e) message("Could not retrieve ", compound_id))
+}
+
+compound_data4 <- data.frame(
+  Best_Guess_Compound = names(compound_info),
+  Best_Guess_Name     = unlist(compound_info),
+  stringsAsFactors    = FALSE
+)
+```
+
+## xMSannotator (tier-2/3 confidence)
+
+```{r, eval=FALSE, warning=FALSE, message=FALSE}
+library(xMSannotator)
+data(adduct_table); data(adduct_weights)
+
+# HILIC positive
+dataA <- annotation_input(metab_hilic) %>% unique()
+max.mz.diff        <- 10
+max.rt.diff        <- 30
+corthresh          <- 0.7
+max_isp            <- 5
+mass_defect_window <- 0.01
+
+multilevelannotation(
+  dataA = dataA, max.mz.diff = max.mz.diff, max.rt.diff = max.rt.diff,
+  cormethod = "pearson", num_nodes = 2,
+  queryadductlist = c("all"), mode = "pos",
+  outloc = "xmsAnnotator/hilic",
+  db_name = "HMDB", adduct_weights = adduct_weights,
+  num_sets = 300, allsteps = TRUE,
+  corthresh = corthresh, NOPS_check = TRUE,
+  deepsplit = 2, networktype = "unsigned",
+  minclustsize = 10, module.merge.dissimilarity = 0.2,
+  filter.by = c("M+H"), max_isp = max_isp,
+  HMDBselect = "union", mass_defect_window = mass_defect_window,
+  pathwaycheckmode = "pm", mass_defect_mode = "pos"
+)
+
+# C18 negative — same call with mode = "neg", filter.by = c("M-H"),
+# and outloc = "xmsAnnotator/c18"
+```
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+# Stage 5 = consensus annotations. Keep Confidence >= 2.
+xms_hilic <- xms_hilic_raw %>% mutate(mode = "positive") %>% filter(Confidence >= 2)
+xms_c18   <- xms_c18_raw   %>% mutate(mode = "negative") %>% filter(Confidence >= 2)
+xms_data  <- bind_rows(xms_hilic, xms_c18)
+
+xms_matched <- left_join(annotation_base, xms_data, by = "mode") %>%
+  filter(lower_mz   <= mz.y   & mz.y   <= upper_mz,
+         lower_time <= time.y & time.y <= upper_time) %>%
+  select(-c(mz.y, time.y)) %>%
+  rename(mz = mz.x, time = time.x)
+```
