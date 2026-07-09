@@ -1,10 +1,10 @@
 # Air Pollution and the Serum Metabolome in PD
 
-This repository hosts the code and methodology used for conducting the statistical analyses presented in our research paper, submitted to npj Parkinson's Disease.
+This repository hosts the code and methodology used for conducting the statistical analyses presented in our research paper, published in npj Parkinson's Disease, 2026.
 
 ## Overview
 
-The purpose of this repository is to provide transparency and reproducibility for the computational analyses carried out in our study of long-term ambient air pollution exposures (PM~2.5~, CO, and NO~2~) and the untargeted serum LC-HRMS metabolome in Parkinson's disease patients and population-based controls.
+The purpose of this repository is to provide transparency and reproducibility for the computational analyses carried out in our study of long-term ambient air pollution exposures (PM2.5, CO, and NO2) and the untargeted serum LC-HRMS metabolome in Parkinson's disease patients and population-based controls.
 
 ## Contents
 
@@ -15,4 +15,4 @@ The purpose of this repository is to provide transparency and reproducibility fo
 
 ## Citation
 
-Kwon, D., et al. Air pollution and the serum metabolome in patients with Parkinson's disease. *Manuscript submitted.*
+Kwon, D., Paul, K.C., Lin, Y. et al. Untargeted serum metabolomics and air pollution in Parkinson’s disease. npj Parkinsons Dis. (2026). https://doi.org/10.1038/s41531-026-01451-3
